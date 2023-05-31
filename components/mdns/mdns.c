@@ -40,6 +40,9 @@ void mdns_debug_packet(const uint8_t *data, size_t len);
 
 static const char *MDNS_DEFAULT_DOMAIN = "local";
 static const char *MDNS_SUB_STR = "_sub";
+#define NEGATIVE_ANSWER_BITMAP_LEN 32
+static uint8_t delegated_host_query_flag[NEGATIVE_ANSWER_BITMAP_LEN];
+static uint8_t delegated_host_answer_flag[NEGATIVE_ANSWER_BITMAP_LEN];
 
 mdns_server_t *_mdns_server = NULL;
 static mdns_host_item_t *_mdns_host_list = NULL;
@@ -574,6 +577,9 @@ static inline uint8_t _mdns_append_type(uint8_t *packet, uint16_t *index, uint8_
     } else if (type == MDNS_ANSWER_AAAA) {
         _mdns_append_u16(packet, index, MDNS_TYPE_AAAA);
         _mdns_append_u16(packet, index, mdns_class);
+    } else if (type == MDNS_ANSWER_NSEC) {
+        _mdns_append_u16(packet, index, MDNS_TYPE_NSEC);
+        _mdns_append_u16(packet, index, mdns_class);
     } else {
         return 0;
     }
@@ -1055,6 +1061,77 @@ static uint16_t _mdns_append_srv_record(uint8_t *packet, uint16_t *index, mdns_s
 }
 
 /**
+ * @brief  appends NSEC record to a packet, incrementing the index.
+ *         From now, only support the delegated host.
+ *
+ * @param  packet       MDNS packet
+ * @param  index        offset in the packet
+ * @param  hostname     the hostname address to add
+ * @param  ip           the IP address to add
+ *
+ * @return length of added data: 0 on error or length on success
+ */
+
+static uint16_t _mdns_append_nsec_record(uint8_t *packet, uint16_t *index, uint8_t *queries_answered)
+{
+    const char *str[] =  { _mdns_self_host.hostname, MDNS_DEFAULT_DOMAIN };
+    uint16_t record_length;
+    uint8_t part_length;
+
+    if (_str_null_or_empty(str[0])) {
+        return 0;
+    }
+
+    part_length = _mdns_append_fqdn(packet, index, str, 2, MDNS_MAX_PACKET_SIZE);
+    if (!part_length) {
+        return 0;
+    }
+    record_length += part_length;
+
+    part_length = _mdns_append_type(packet, index, MDNS_ANSWER_NSEC, false, MDNS_ANSWER_A_TTL);
+    if (!part_length) {
+        return 0;
+    }
+    record_length += part_length;
+
+    uint16_t data_len_location = *index - 2;
+
+    part_length = _mdns_append_fqdn(packet, index, str, 2, MDNS_MAX_PACKET_SIZE);
+    if (!part_length) {
+        return 0;
+    }
+    record_length += part_length;
+    if (!_mdns_append_u8(packet, index, 0)) {
+        return 0;
+    }
+    uint8_t bitmap_size_location = *index;
+    *index += 1;
+
+    uint8_t bitmap_size = NEGATIVE_ANSWER_BITMAP_LEN;
+    // Find the first valid index,
+    // if the highest 8-bit is zero, do not record it in NSEC recoed.
+    for (int i = bitmap_size; i > 0; i--) {
+        if (queries_answered[i - 1] != 0) {
+            break;
+        }
+        bitmap_size--;
+    }
+    // Record these bits to NSEC record.
+    for (int i = 0; i < bitmap_size; i++) {
+        if (!_mdns_append_u8(packet, index, queries_answered[i])) {
+            return 0;
+        }
+    }
+
+    packet[bitmap_size_location] = bitmap_size;
+    part_length += 2 + bitmap_size;
+
+    _mdns_set_u16(packet, data_len_location, part_length);
+
+    return 1;
+}
+
+/**
  * @brief  appends A record to a packet, incrementing the index
  *
  * @param  packet       MDNS packet
@@ -1473,6 +1550,10 @@ static void _mdns_dispatch_tx_packet(mdns_tx_packet_t *p)
         count += _mdns_append_answer(packet, &index, a, p->tcpip_if);
         a = a->next;
     }
+    // if some delegated-host queries not answered, append negative reply
+    if (memcmp(delegated_host_query_flag, delegated_host_answer_flag, NEGATIVE_ANSWER_BITMAP_LEN) != 0) {
+        count += _mdns_append_nsec_record(packet, &index, delegated_host_answer_flag);
+    }
     _mdns_set_u16(packet, MDNS_HEAD_ADDITIONAL_OFFSET, count);
 
 #ifdef MDNS_ENABLE_DEBUG
@@ -1695,6 +1776,22 @@ static bool _mdns_alloc_answer(mdns_out_answer_t **destination, uint16_t type, m
 }
 
 /**
+ * @brief  Mark a flag for recording all the types in a query.
+ *
+ */
+static void _mdns_mark_query_answer_flag(uint8_t *flag, uint16_t type)
+{
+    // According to RFC 6762, section 6.1(page 17), rrtypes above 255 are not
+    // currently in widespread use, now, only record the type is lower than 255
+    if (type > 255) {
+        return;
+    }
+    uint8_t index = type / 8;
+    uint8_t offset = type % 8;
+    *(flag + index) |= (1 << offset);
+}
+
+/**
  * @brief  Allocate new packet for sending
  */
 static mdns_tx_packet_t *_mdns_alloc_packet_default(mdns_if_t tcpip_if, mdns_ip_protocol_t ip_protocol)
@@ -1848,6 +1945,11 @@ static void _mdns_create_answer_from_parsed_packet(mdns_parsed_packet_t *parsed_
         } else if (!_mdns_alloc_answer(&packet->answers, q->type, NULL, NULL, send_flush, false)) {
             _mdns_free_tx_packet(packet);
             return;
+        }
+        // Only record delegated host.
+        mdns_host_item_t *host = mdns_get_host_item(q->host);
+        if (host != &_mdns_self_host) {
+            _mdns_mark_query_answer_flag(delegated_host_answer_flag, q->type);
         }
 
         if (parsed_packet->src_port != MDNS_SERVICE_PORT &&  // Repeat the queries only for "One-Shot mDNS queries"
@@ -3467,6 +3569,10 @@ void mdns_parse_packet(mdns_rx_packet_t *packet)
     bool do_not_reply = false;
     mdns_search_once_t *search_result = NULL;
 
+    // clear the query flag for delegated host
+    memset(delegated_host_query_flag, 0, NEGATIVE_ANSWER_BITMAP_LEN);
+    memset(delegated_host_answer_flag, 0, NEGATIVE_ANSWER_BITMAP_LEN);
+
 #ifdef MDNS_ENABLE_DEBUG
     _mdns_dbg_printf("\nRX[%u][%u]: ", packet->tcpip_if, (uint32_t)packet->ip_protocol);
     if (packet->src.type == ESP_IPADDR_TYPE_V4) {
@@ -3590,6 +3696,8 @@ void mdns_parse_packet(mdns_rx_packet_t *packet)
                 continue;
             }
             if (!_mdns_name_is_ours(name)) {
+                // mark the flag to indicate current type need to be answered, only for delegated host.
+                _mdns_mark_query_answer_flag(delegated_host_query_flag, type);
                 continue;
             }
 
